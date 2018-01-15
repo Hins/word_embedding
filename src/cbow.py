@@ -1,19 +1,17 @@
 # -*-coding:utf-8-*-
 """
-NNLM：《A Neural Probabilistic Language Model》
-1. Projection layer：将一句话拆分成多个样本，每个样本长度为上下文窗口长度 * embedding长度
-2. Hidden layer：非线性变换
+CBOW
+1. Projection layer：将一句话拆分成多个样本，样本长度为embedding长度
 3. Output layer：仿射变换，适配输出维度
 4. Softmax or NCE
 潘晓彤
-2017.11.24
+2017.12.7
 
 样本总量：sample_size
 训练样本总量：train_set_size
 one-hot长度(字典长度)：words_in_sentence，短文本补零处理
 embedding长度：cfg.embedding_size
 embedding窗口长度：cfg.embedding_window
-Hidden层维度：cfg.hidden_size
 """
 
 import os
@@ -23,7 +21,7 @@ import numpy as np
 import tensorflow as tf
 from config import cfg
 
-class NNLM():
+class CBOW():
     def __init__(self, sess, embed_file):
         self.input_samples = tf.placeholder(shape=[cfg.batch_size, cfg.embedding_window], dtype=tf.int32)
         self.label = tf.placeholder(shape=[cfg.batch_size], dtype=tf.int32)
@@ -31,74 +29,47 @@ class NNLM():
         self.embed_file = embed_file
         self.sess = sess
 
-        with tf.device('/gpu:0'):
-            with tf.variable_scope("nnlm") as scope:
-                # 特征矩阵：[dictionary_size, cfg.embedding_size]
-                self.embed_weight = tf.get_variable(
-                    'embed_weight',
-                    shape=(dictionary_size, cfg.embedding_size),
-                    initializer=tf.random_normal_initializer(stddev=cfg.stddev),
-                    dtype='float64'
-                )
+        with tf.variable_scope("cbow") as scope:
+            # 特征矩阵：[dictionary_size, cfg.embedding_size]
+            self.embed_weight = tf.get_variable(
+                'embed_weight',
+                shape=(dictionary_size, cfg.embedding_size),
+                initializer=tf.random_normal_initializer(stddev=cfg.stddev),
+                dtype='float64'
+            )
 
-                # 特征矩阵bias：dictionary_size
-                embed_bias = tf.get_variable(
-                    'embed_bias',
-                    shape=(dictionary_size),
-                    initializer=tf.random_normal_initializer(stddev=cfg.stddev),
-                    dtype='float64'
-                )
+            # 特征矩阵bias：dictionary_size
+            embed_bias = tf.get_variable(
+                'embed_bias',
+                shape=(dictionary_size),
+                initializer=tf.random_normal_initializer(stddev=cfg.stddev),
+                dtype='float64'
+            )
 
-                # 样本embedding矩阵：[cfg.batch_size, cfg.embedding_window, cfg.embedding_size]
-                embed_init = tf.nn.embedding_lookup(self.embed_weight, self.input_samples)
+            # 样本embedding矩阵：[cfg.batch_size, cfg.embedding_window, cfg.embedding_size]
+            embed_init = tf.nn.embedding_lookup(self.embed_weight, self.input_samples)
 
-                # 从embedding到hidden层权重矩阵：[cfg.hidden_size, cfg.embedding_window * cfg.embedding_size]
-                # 与CBOW/Skip-gram不同，将上下文窗口中的词向量表示concat起来，而不是加权平均
-                proj_hidden_weight = tf.get_variable(
-                    'proj_hidden_weight',
-                    shape=(cfg.hidden_size, cfg.embedding_window * cfg.embedding_size),
-                    initializer=tf.random_normal_initializer(stddev=cfg.stddev),
-                    dtype='float64'
-                )
+            # CBOW将上下文窗口中每个词的embedding相加
+            proj_layer = tf.reduce_sum(embed_init, axis=1)
 
-                # 从embedding到hidden层bias：[cfg.hidden_size]
-                proj_hidden_bias = tf.get_variable(
-                    'proj_hidden_bias',
-                    shape=(cfg.hidden_size),
-                    initializer=tf.random_normal_initializer(stddev=cfg.stddev),
-                    dtype='float64'
-                )
+            # 从projection层到输出层权重矩阵：[cfg.embedding_size, dictionary_size]
+            proj_output_weight = tf.get_variable(
+                'proj_output_weight',
+                shape=(cfg.embedding_size, dictionary_size),
+                initializer=tf.random_normal_initializer(stddev=cfg.stddev),
+                dtype='float64'
+            )
 
-                # 从hidden层到输出层权重矩阵：[dictionary_size, cfg.hidden_size]
-                hidden_output_weight = tf.get_variable(
-                    'hidden_output_weight',
-                    shape=(dictionary_size, cfg.hidden_size),
-                    initializer=tf.random_normal_initializer(stddev=cfg.stddev),
-                    dtype='float64'
-                )
+            # 从projection层到输出层bias：[dictionary_size]
+            proj_output_bias = tf.get_variable(
+                'proj_output_bias',
+                shape=[dictionary_size],
+                initializer=tf.random_normal_initializer(stddev=cfg.stddev),
+                dtype='float64'
+            )
 
-                # 从hidden层到输出层bias：[dictionary_size]
-                hidden_output_bias = tf.get_variable(
-                    'hidden_output_bias',
-                    shape=[dictionary_size],
-                    initializer=tf.random_normal_initializer(stddev=cfg.stddev),
-                    dtype='float64'
-                )
-
-                # 将一个样本中的embedding matrix平摊成embedding vector
-                proj_layer = tf.concat(axis=0, values=[
-                    tf.reshape(embed_init, shape=[-1])
-                ])
-
-                proj_layer = tf.reshape(proj_layer, shape=[cfg.embedding_window * cfg.embedding_size, -1])    # [cfg.embedding_window * cfg.embedding_size, cfg.batch_size]: [1024, 256]
-                proj_layer = tf.matmul(proj_hidden_weight, tf.nn.tanh(proj_layer))    # [cfg.hidden_size, cfg.batch_size]
-                proj_layer = tf.reshape(proj_layer, shape=[cfg.batch_size, -1])
-                proj_layer = tf.nn.bias_add(proj_layer, proj_hidden_bias)    # [cfg.batch_size, cfg.hidden_size]
-                proj_layer = tf.reshape(proj_layer, shape=[cfg.hidden_size, -1])
-                hidden_layer = tf.matmul(hidden_output_weight, proj_layer)    # [dictionary size, cfg.batch_size]
-                hidden_layer = tf.reshape(hidden_layer, shape=[-1, dictionary_size])    # [cfg.batch_size, dictionary size]
-                hidden_layer = tf.nn.bias_add(hidden_layer, hidden_output_bias)
-                self.output_layer = tf.nn.softmax(hidden_layer)    # [cfg.batch_size, dictionary size]
+            self.output_layer = tf.nn.bias_add(tf.matmul(proj_layer, proj_output_weight), proj_output_bias)
+            self.output_layer = tf.nn.softmax(self.output_layer)    # [cfg.batch_size, dictionary size]
 
     def train(self):
         with tf.device('/gpu:0'):
@@ -154,7 +125,7 @@ class NNLM():
             comparision = tf.equal(predict_result, self.label)    # [cfg.batch_size]
             self.accuracy = tf.reduce_sum(tf.cast(comparision, dtype=tf.float32))
 
-            total_accuracy = 0
+            total_accuracy = 0.0
             total_batch_size = sample_size / cfg.batch_size
             validate_set_iteration = train_set_size / cfg.batch_size + 1
             validate_batch_size = total_batch_size - train_set_size / cfg.batch_size
@@ -175,14 +146,14 @@ class NNLM():
                     index = sub_iter - iter * cfg.batch_size
                     validate_set_label[index] = samples[sub_iter][sub_embedding_window]
                     validate_set[index] = samples[sub_iter][sub_embedding_window]
-                accuracy = self.sess.run(self.accuracy,feed_dict={self.input_samples: validate_set,self.label: validate_set_label})
+                accuracy = self.sess.run(self.accuracy, feed_dict={self.input_samples: validate_set, self.label: validate_set_label})
                 total_accuracy += accuracy
             if validate_batch_size > 0:
                 print('accuracy is %f' % (total_accuracy / validate_batch_size))
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
-        print "nnlm <dictionary file> <onehot file> <embed file>"
+        print "cbow <dictionary file> <onehot file> <embed file>"
         sys.exit()
 
     # 上(下)文窗口大小：sub_embedding_window
@@ -211,9 +182,9 @@ if __name__ == "__main__":
     train_set_size = int(sample_size / cfg.batch_size * cfg.train_set_ratio) * cfg.batch_size
 
     config = tf.ConfigProto(allow_soft_placement = True)
-    with tf.Session(config = config) as sess:
-        nnlm_obj = NNLM(sess, sys.argv[3])
+    with tf.Session(config=config) as sess:
+        cbow_obj = CBOW(sess, sys.argv[3])
         sess.run(tf.global_variables_initializer())
-        nnlm_obj.train()
-        nnlm_obj.test()
+        cbow_obj.train()
+        cbow_obj.test()
         sess.close()
